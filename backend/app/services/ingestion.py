@@ -90,17 +90,26 @@ async def pdf_bytes_to_faiss(
 
     # Create one source document per page first to avoid over-merging short pages.
     page_docs = [Document(page_content=page_text, metadata={"page": i + 1}) for i, page_text in enumerate(pages)]
-    # Try semantic chunking first for topic-coherent chunks.
-    docs = semantic_split_documents(page_docs, embeddings)
-    # Semantic mode can occasionally under-split short docs; enforce useful minimum granularity.
-    min_expected_chunks = max(6, len(page_docs) * 2)
-    if len(docs) < min_expected_chunks:
-        # Fall back to deterministic recursive chunking when semantic output is too coarse.
-        splitter = build_text_splitter()
-        docs = splitter.split_documents(page_docs)
+
+    # Pre-split pages into safe-sized base chunks so any embedding model (even with
+    # a 512-token context like mxbai-embed-large) can embed them without error.
+    base_splitter = build_text_splitter()
+    base_docs = base_splitter.split_documents(page_docs)
     # Guard against pathological splitter output.
-    if not docs:
+    if not base_docs:
         raise ValueError("Document produced zero chunks after splitting")
+
+    # Try semantic chunking on top of the base splits for topic-coherent grouping.
+    # Fall back silently if the embedding model can't handle the input shape.
+    try:
+        semantic_docs = semantic_split_documents(base_docs, embeddings)
+    except Exception:
+        semantic_docs = []
+
+    # Use semantic chunks only when they produce reasonable granularity; otherwise
+    # keep the deterministic recursive base chunks which always work.
+    min_expected_chunks = max(6, len(page_docs) * 2)
+    docs = semantic_docs if len(semantic_docs) >= min_expected_chunks else base_docs
 
     # Async embed all chunk documents and construct the in-memory FAISS index.
     store = await FAISS.afrom_documents(docs, embeddings)

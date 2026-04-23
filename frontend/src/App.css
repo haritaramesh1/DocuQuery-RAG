@@ -430,6 +430,19 @@
 }
 .source-button:hover { text-decoration: underline; }
 
+/* Blinking caret appended to streaming answers. */
+.cursor-blink {
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--accent);
+  animation: caret-blink 1s steps(2) infinite;
+  font-weight: 600;
+}
+@keyframes caret-blink {
+  0%, 100% { opacity: 0; }
+  50% { opacity: 1; }
+}
+
 /* Typing indicator (assistant is thinking). */
 .typing {
   display: inline-flex;

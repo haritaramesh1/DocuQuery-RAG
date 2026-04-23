@@ -8,12 +8,16 @@ import logging
 # asynccontextmanager lets us define startup/shutdown hooks around the app instance.
 from contextlib import asynccontextmanager
 
+# json is used to serialize NDJSON events for the streaming endpoint.
+import json as jsonlib
 # Loads key=value pairs from a .env file into os.environ before other imports use them.
 from dotenv import load_dotenv
 # FastAPI core: routing, dependency injection, file uploads, HTTP errors.
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 # CORS middleware so the browser SPA on another port may call this API.
 from fastapi.middleware.cors import CORSMiddleware
+# StreamingResponse lets /query/stream push tokens as they are produced.
+from fastapi.responses import StreamingResponse
 # Local Ollama chat model class used as a FastAPI dependency type hint.
 from langchain_community.chat_models import ChatOllama
 
@@ -68,6 +72,12 @@ def get_state() -> AppState:
 def get_chat_llm() -> ChatOllama:
     # Delegate construction to rag module (reads env for model/base URL).
     return rag.make_chat_ollama()
+
+
+# Streaming variant of the chat LLM (no JSON format constraint).
+def get_streaming_chat_llm() -> ChatOllama:
+    # Delegate construction so both factories share env-backed defaults.
+    return rag.make_streaming_chat_ollama()
 
 
 # POST /upload: multipart PDF → hash → optional cache hit → else embed + FAISS.
@@ -229,6 +239,68 @@ async def query_documents(
         document_hash=doc_hash,
         # Echo k used for retrieval transparency.
         top_k=body.top_k,
+    )
+
+
+# POST /query/stream: NDJSON stream — per-token events followed by a final "done" event.
+@app.post("/query/stream")
+async def query_documents_stream(
+    body: QueryRequest,
+    state: AppState = Depends(get_state),
+    llm: ChatOllama = Depends(get_streaming_chat_llm),
+):
+    # Resolve document hash (explicit or latest).
+    doc_hash = body.document_hash or state.last_hash
+    if not doc_hash:
+        raise HTTPException(status_code=400, detail="No document is indexed. Upload a PDF first.")
+
+    # Fetch FAISS entry for this hash.
+    entry = state.get(doc_hash)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Unknown document_hash. Upload the document again.")
+
+    # Retrieve grounding chunks up front so the first streamed event can include them.
+    try:
+        retrieved = await rag.retrieve_chunks(entry.faiss, body.question, body.top_k)
+    except Exception as exc:
+        logger.exception("Retrieval failed")
+        raise HTTPException(status_code=502, detail=f"Retrieval failed: {exc}") from exc
+
+    if not retrieved:
+        raise HTTPException(status_code=502, detail="Retrieval returned no chunks.")
+
+    # Async generator that yields NDJSON lines the client reads incrementally.
+    async def event_stream():
+        # Emit a "meta" event first so the UI can show retrieved chunks while tokens stream.
+        yield jsonlib.dumps({
+            "type": "meta",
+            "document_hash": doc_hash,
+            "top_k": body.top_k,
+            "sources": retrieved,
+        }) + "\n"
+        # Stream each token as its own event; UI appends to the live answer bubble.
+        try:
+            async for token in rag.stream_answer(llm, body.question, retrieved):
+                yield jsonlib.dumps({"type": "token", "text": token}) + "\n"
+        except Exception as exc:
+            # Emit a terminal error event so the UI can show a friendly message.
+            yield jsonlib.dumps({
+                "type": "error",
+                "detail": f"Chat completion failed (model `{ollama_llm_model()}`): {type(exc).__name__}: {exc}",
+            }) + "\n"
+            return
+        # Final "done" event lets the UI drop the typing indicator and show sources.
+        yield jsonlib.dumps({"type": "done"}) + "\n"
+
+    # application/x-ndjson keeps proxies/buffers from batching lines together.
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={
+            # Disable nginx/intermediate buffering so tokens arrive promptly in the browser.
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+        },
     )
 
 

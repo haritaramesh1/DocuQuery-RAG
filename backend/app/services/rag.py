@@ -29,7 +29,7 @@ from app.schemas import LLMStructuredAnswer
 # Module logger so real errors show up in uvicorn output.
 logger = logging.getLogger(__name__)
 
-# System prompt: short, explicit rules and strict JSON output.
+# System prompt for non-streaming JSON mode (structured answer).
 SYSTEM_INSTRUCTION = """You explain passages from a user's uploaded document.
 
 Rules:
@@ -43,6 +43,19 @@ Rules:
 Reply with ONE JSON object and nothing else:
 {"answer": "<your explanation>", "source_chunks": ["<short quote 1>", "<short quote 2>"], "confidence": <0-1>}
 """
+
+# System prompt for streaming mode (plain prose — no JSON wrapping).
+STREAM_SYSTEM_INSTRUCTION = """You explain passages from a user's uploaded document.
+
+Rules:
+- Use the numbered context passages below to answer.
+- Do NOT copy a passage verbatim. Write your own explanation in natural language.
+- If the user asks to "explain ...", give 3-5 sentences covering what the topic is, key terms, and what is being asked or done.
+- For direct factual questions, answer in 1-3 sentences.
+- You may combine information from multiple passages.
+- Only say "I don't know" if the context truly does not contain the answer.
+
+Answer in plain prose. Do NOT output JSON, bullet markup, or markdown code fences."""
 
 
 # Formats retrieved chunk strings as numbered blocks for the prompt.
@@ -242,3 +255,53 @@ def make_chat_ollama() -> ChatOllama:
         # Ask Ollama to emit JSON object text for easier parsing.
         format="json",
     )
+
+
+# Builds a streaming ChatOllama client (plain text, no JSON format constraint).
+def make_streaming_chat_ollama() -> ChatOllama:
+    # Same base settings as the JSON variant but without format="json" so tokens
+    # can be emitted incrementally as natural prose.
+    return ChatOllama(
+        model=ollama_llm_model(),
+        base_url=ollama_base_url(),
+        temperature=0.1,
+        num_predict=ollama_num_predict(),
+        num_ctx=4096,
+        keep_alive="30m",
+        timeout=300.0,
+        streaming=True,
+    )
+
+
+# Async generator: yields individual text tokens/chunks from the LLM as they stream.
+async def stream_answer(
+    llm: ChatOllama,
+    question: str,
+    retrieved_chunks: list[str],
+):
+    # Numbered context block used as grounding input.
+    context_block = _format_context(retrieved_chunks)
+    # User turn mirrors the non-streaming endpoint for prompt parity.
+    user_msg = f"""Context passages:
+
+{context_block}
+
+Question: {question}
+"""
+    # astream yields AIMessageChunk objects one token (or small group) at a time.
+    try:
+        async for chunk in llm.astream(
+            [
+                SystemMessage(content=STREAM_SYSTEM_INSTRUCTION),
+                HumanMessage(content=user_msg),
+            ]
+        ):
+            # Convert any possible multi-part content to a flat string.
+            text = _message_content_to_text(chunk.content)
+            # Skip empty keepalive chunks so the UI only sees real text.
+            if text:
+                yield text
+    except Exception:
+        # Surface the full traceback in uvicorn logs for debugging.
+        logger.exception("ChatOllama stream failed")
+        raise

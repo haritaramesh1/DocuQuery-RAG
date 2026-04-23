@@ -30,6 +30,55 @@ async function postJson(path, body) {
   return data;
 }
 
+// Streams /query/stream as NDJSON. onEvent is called for each parsed JSON line.
+async function streamQuery(body, onEvent) {
+  const res = await fetch(`${apiBase()}/query/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok || !res.body) {
+    // Surface plain HTTP errors before the stream starts.
+    const text = await res.text().catch(() => "");
+    let detail = text;
+    try {
+      detail = JSON.parse(text)?.detail ?? text;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail || `Request failed (${res.status})`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // Process complete NDJSON lines; retain any partial trailing line in buffer.
+    let newlineIdx;
+    while ((newlineIdx = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newlineIdx).trim();
+      buffer = buffer.slice(newlineIdx + 1);
+      if (!line) continue;
+      try {
+        onEvent(JSON.parse(line));
+      } catch {
+        // Ignore malformed lines rather than killing the stream.
+      }
+    }
+  }
+  // Flush any trailing line without a newline terminator.
+  const tail = buffer.trim();
+  if (tail) {
+    try {
+      onEvent(JSON.parse(tail));
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 async function postUpload(file) {
   const fd = new FormData();
   fd.append("file", file);
@@ -176,26 +225,91 @@ export default function App() {
     }
     setQueryBusy(true);
     setInput("");
-    setMessages((m) => [...m, { role: "user", content: q }]);
+    // Push user bubble + an empty assistant bubble that we'll fill as tokens stream.
+    setMessages((m) => [
+      ...m,
+      { role: "user", content: q },
+      { role: "assistant", content: "", streaming: true, sources: null },
+    ]);
     try {
-      const data = await postJson("/query", {
-        question: q,
-        document_hash: documentHash,
-        top_k: 6,
-      });
-      setMessages((m) => [
-        ...m,
-        {
-          role: "assistant",
-          content: data.answer,
-          confidence: data.confidence,
-          sources: data.source_chunks,
+      let sawError = false;
+      await streamQuery(
+        { question: q, document_hash: documentHash, top_k: 6 },
+        (evt) => {
+          if (evt.type === "meta") {
+            setSelectedSources(evt.sources || []);
+            // Attach sources to the still-streaming assistant message.
+            setMessages((m) => {
+              const copy = m.slice();
+              for (let i = copy.length - 1; i >= 0; i -= 1) {
+                if (copy[i].role === "assistant" && copy[i].streaming) {
+                  copy[i] = { ...copy[i], sources: evt.sources || [] };
+                  break;
+                }
+              }
+              return copy;
+            });
+          } else if (evt.type === "token") {
+            // Append the token to the last streaming assistant bubble.
+            setMessages((m) => {
+              const copy = m.slice();
+              for (let i = copy.length - 1; i >= 0; i -= 1) {
+                if (copy[i].role === "assistant" && copy[i].streaming) {
+                  copy[i] = { ...copy[i], content: copy[i].content + (evt.text || "") };
+                  break;
+                }
+              }
+              return copy;
+            });
+          } else if (evt.type === "error") {
+            sawError = true;
+            setQueryError(evt.detail || "Stream error");
+            setMessages((m) => {
+              const copy = m.slice();
+              // Remove the empty streaming placeholder, replace with an error bubble.
+              for (let i = copy.length - 1; i >= 0; i -= 1) {
+                if (copy[i].role === "assistant" && copy[i].streaming) {
+                  copy.splice(i, 1);
+                  break;
+                }
+              }
+              copy.push({ role: "error", content: evt.detail || "Stream error" });
+              return copy;
+            });
+          } else if (evt.type === "done") {
+            // Mark streaming complete; bubble keeps its accumulated text + sources.
+            setMessages((m) => {
+              const copy = m.slice();
+              for (let i = copy.length - 1; i >= 0; i -= 1) {
+                if (copy[i].role === "assistant" && copy[i].streaming) {
+                  copy[i] = { ...copy[i], streaming: false };
+                  break;
+                }
+              }
+              return copy;
+            });
+          }
         },
-      ]);
-      setSelectedSources(data.source_chunks);
+      );
+      if (!sawError) {
+        // Safety net in case "done" never arrived — still clear the streaming flag.
+        setMessages((m) =>
+          m.map((msg) => (msg.role === "assistant" && msg.streaming ? { ...msg, streaming: false } : msg)),
+        );
+      }
     } catch (e) {
       setQueryError(e.message || String(e));
-      setMessages((m) => [...m, { role: "error", content: e.message || String(e) }]);
+      setMessages((m) => {
+        const copy = m.slice();
+        for (let i = copy.length - 1; i >= 0; i -= 1) {
+          if (copy[i].role === "assistant" && copy[i].streaming) {
+            copy.splice(i, 1);
+            break;
+          }
+        }
+        copy.push({ role: "error", content: e.message || String(e) });
+        return copy;
+      });
     } finally {
       setQueryBusy(false);
     }
@@ -378,40 +492,32 @@ export default function App() {
                     );
                   }
                   // assistant
+                  const empty = !m.content;
                   return (
                     <li key={idx} className="msg assistant">
                       <div className="avatar assistant">AI</div>
                       <div>
-                        <div className="bubble">{m.content}</div>
-                        {(m.confidence != null || m.sources?.length) ? (
+                        <div className="bubble">
+                          {empty && m.streaming ? (
+                            <div className="typing"><span /><span /><span /></div>
+                          ) : (
+                            <>
+                              {m.content}
+                              {m.streaming ? <span className="cursor-blink">▍</span> : null}
+                            </>
+                          )}
+                        </div>
+                        {!m.streaming && m.sources?.length ? (
                           <div className="msg-footer">
-                            {m.confidence != null ? (
-                              <span className="confidence-bar" title="Answer confidence">
-                                <span className="bar-track">
-                                  <span className="bar-fill" style={{ width: `${Math.round((m.confidence || 0) * 100)}%` }} />
-                                </span>
-                                {(m.confidence * 100).toFixed(0)}%
-                              </span>
-                            ) : null}
-                            {m.sources?.length ? (
-                              <button type="button" className="source-button" onClick={() => setSelectedSources(m.sources)}>
-                                View {m.sources.length} source{m.sources.length === 1 ? "" : "s"}
-                              </button>
-                            ) : null}
+                            <button type="button" className="source-button" onClick={() => setSelectedSources(m.sources)}>
+                              View {m.sources.length} source{m.sources.length === 1 ? "" : "s"}
+                            </button>
                           </div>
                         ) : null}
                       </div>
                     </li>
                   );
                 })}
-                {queryBusy ? (
-                  <li className="msg assistant">
-                    <div className="avatar assistant">AI</div>
-                    <div className="bubble">
-                      <div className="typing"><span /><span /><span /></div>
-                    </div>
-                  </li>
-                ) : null}
               </ul>
             )}
           </div>
