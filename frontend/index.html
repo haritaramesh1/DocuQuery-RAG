@@ -1,0 +1,27 @@
+<!doctype html>
+<!-- HTML5 doctype selects standards mode in browsers. -->
+<html lang="en">
+  <head>
+    <!-- UTF-8 covers all characters in UI copy without mojibake. -->
+    <meta charset="UTF-8" />
+    <!-- Responsive meta tag: mobile browsers use device width as CSS px basis. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Browser tab title for this SPA shell. -->
+    <title>Document Q&A</title>
+    <!-- Hint early DNS/TLS connection to Google Fonts for faster font download. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <!-- preconnect to static font host; crossorigin matches font CSS/CORS rules. -->
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!-- Load DM Sans + JetBrains Mono families used by global CSS variables/classes. -->
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <!-- React mounts into this empty container at runtime (see src/main.jsx). -->
+    <div id="root"></div>
+    <!-- Vite serves this as ES module; triggers React app bootstrap. -->
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
